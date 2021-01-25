@@ -1,0 +1,280 @@
+{% 
+  macro resources(
+    vpc_name,
+    vpc_cidr,
+    vpc_domain,
+    public_subnets=['public'],
+    private_subnets=['medium','high','management'], 
+    az_count=2, 
+    subnet_size=24,
+    dns_servers=[],
+    ntp_servers=[],
+    domain_name='',
+    private_domains=[],
+    public_domains=[])
+%}
+{% set vpc_prefix = vpc_name | title %}
+  {{ vpc_prefix }}Vpc:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: "{{ vpc_cidr }}"
+      EnableDnsSupport: True
+      EnableDnsHostnames: True
+      Tags:
+        - Key: "Name"
+          Value: "{{ vpc_name + '-vpc' }}"
+  {{ vpc_prefix }}InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties: 
+      Tags:
+        - Key: "Name"
+          Value: "{{ vpc_name + '-igw' }}"
+        - Key: "org:security:level"
+          Value: "public"
+  {{ vpc_prefix }}InternetGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      InternetGatewayId: { "Ref": "{{ vpc_prefix }}InternetGateway" }
+      VpcId:
+        Ref: {{ vpc_prefix }}Vpc
+  {{ vpc_prefix }}PublicRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId:
+        Ref: {{ vpc_prefix }}Vpc
+      Tags:
+        - Key: "Name"
+          Value: "{{ vpc_name + '-public-route-table' }}"
+        - Key: "org:security:level"
+          Value: "public"
+  {{ vpc_prefix }}PrivateRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId:
+        Ref: {{ vpc_prefix }}Vpc
+      Tags:
+        - Key: "Name"
+          Value: "{{ vpc_name + '-private-route-table' }}"
+        - Key: "org:security:level"
+          Value: "mixed"
+  {{ vpc_prefix }}PublicDefaultRoute:
+    Type: "AWS::EC2::Route"
+    DependsOn: "{{ vpc_prefix }}InternetGatewayAttachment"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: { "Ref": "{{ vpc_prefix }}InternetGateway" }
+      RouteTableId: { "Ref": "{{ vpc_prefix }}PublicRouteTable" }
+  {{ vpc_prefix }}S3Endpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      RouteTableIds: 
+        - { "Ref": "{{ vpc_prefix }}PublicRouteTable" }
+        - { "Ref": "{{ vpc_prefix }}PrivateRouteTable" }
+      ServiceName: 
+        Fn::Sub: "com.amazonaws.${AWS::Region}.s3"
+      VpcId:
+        Ref: {{ vpc_prefix }}Vpc
+  {{ vpc_prefix }}VpcFlowLog:
+    Type: "AWS::EC2::FlowLog"
+    Properties:
+      DeliverLogsPermissionArn:
+        Fn::Sub: "{{ 'arn:aws:iam::${AWS::AccountId}:role/${' + vpc_prefix + 'VpcFlowLogRole}' }}"
+      LogGroupName:
+        Fn::Sub: ${AWS::StackName}/{{vpc_prefix}}/vpc/FlowLog
+      ResourceId: { "Ref": "{{ vpc_prefix }}Vpc" }
+      ResourceType: "VPC"
+      TrafficType: "ALL"
+  {{ vpc_prefix }}VpcFlowLogRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: [ "vpc-flow-logs.amazonaws.com" ]
+            Action: [ "sts:AssumeRole" ]
+      Path: "/"
+      Policies:
+      - PolicyName: CloudWatchLogs
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+              - "logs:DescribeLogGroups"
+              - "logs:DescribeLogStreams"
+              Resource:
+                Fn::Sub: "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}/{{vpc_prefix}}/vpc/FlowLog*"
+  {{ vpc_prefix }}VpcFlowLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: "Delete"
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/{{vpc_prefix}}/vpc/FlowLog
+      RetentionInDays: 7
+{% if domain_name or dns_servers or ntp_servers %}
+  {{ vpc_prefix }}DhcpOptions:
+    Type: "AWS::EC2::DHCPOptions"
+    Properties:
+{% if domain_name %}
+      DomainName: "{{ domain_name }}"
+{% else %}
+      DomainName: "{{ vpc_domain }}"
+{% endif %}
+{% if dns_servers %}
+      DomainNameServers: {{ dns_servers | to_json }}
+{% endif %}
+{% if ntp_servers %}
+      NtpServers: {{ ntp_servers | to_json }}
+{% endif %}
+      Tags:
+        - Key: "Name"
+          Value: "{{ vpc_name + '-dhcpopts' }}"
+        - Key: "org:security:level"
+          Value: "mixed"
+  {{ vpc_prefix }}DhcpOptionsAssociation: 
+    Type: "AWS::EC2::VPCDHCPOptionsAssociation"
+    Properties:
+      DhcpOptionsId: { "Ref": "{{ vpc_prefix }}DhcpOptions" }
+      VpcId:
+        Ref: {{ vpc_prefix }}Vpc
+{% endif %}
+  {{ vpc_prefix }}VpcPrivateZone:
+    Type: "AWS::Route53::HostedZone"
+    Properties: 
+      HostedZoneConfig: 
+        Comment: "{{ vpc_prefix }}Vpc {{ vpc_name }} private zone"
+      HostedZoneTags:
+        - Key: "Name"
+          Value: "{{ vpc_domain }}"
+        - Key: "org:security:level"
+          Value: "mixed"
+      Name: "{{ vpc_domain }}"
+      VPCs:
+        - VPCId: { "Ref": "{{ vpc_prefix }}Vpc" }
+          VPCRegion: { "Ref": "AWS::Region" }
+{% for domain in (private_domains + public_domains) %}
+  {{ domain | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '') + 'Zone' }}:
+      Type: "AWS::Route53::HostedZone"
+      Properties: 
+        HostedZoneConfig: 
+          Comment: "{{ domain + ' zone' }}"
+        HostedZoneTags:
+          - Key: "Name"
+            Value: "{{ domain }}"
+          - Key: "org:security:level"
+            Value: "mixed"
+        Name: "{{ domain }}"
+{% if domain in private_domains %}
+        VPCs:
+          - VPCId:
+              Ref: {{ vpc_prefix }}Vpc
+            VPCRegion: { "Ref": "AWS::Region" }
+{% endif %}
+{% endfor %}
+{% for subnet in (public_subnets + private_subnets) %}
+{% set outer_loop = loop %}
+{% for zone in range(0, az_count) %}
+{% set subnet_name = subnet | title + "Subnet" + "ABC"[loop.index0] %}
+  {{ vpc_prefix }}{{ subnet_name }}:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId:
+        Ref: {{ vpc_prefix }}Vpc
+      CidrBlock: "{{ vpc_cidr | ipsubnet(subnet_size, az_count * outer_loop.index0 + loop.index0) }}"
+      AvailabilityZone: 
+        Fn::Sub: "${AWS::Region}{{ 'abc'[loop.index0] }}"
+      Tags:
+        - Key: "Name"
+          Value: "{{ subnet | lower }}-{{ 'abc'[loop.index0] }}"
+        - Key: "org:security:level"
+          Value: "{{ subnet | lower }}"
+  {{ vpc_prefix }}{{ subnet_name + "Routing" }}:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+{% if subnet in public_subnets %}
+      RouteTableId: { "Ref": "{{ vpc_prefix }}PublicRouteTable" }
+{% else %}
+      RouteTableId: { "Ref": "{{ vpc_prefix }}PrivateRouteTable" }
+{% endif %}
+      SubnetId: { "Ref": "{{ vpc_prefix + subnet_name }}" }
+{% endfor %}
+{% endfor %}
+{% endmacro %}
+
+{% macro outputs(
+  vpc_name,
+  vpc_cidr,
+  vpc_domain,
+  public_subnets=['public'],
+  private_subnets=['medium','high','management'], 
+  az_count=2, 
+  subnet_size=24,
+  dns_servers=[],
+  ntp_servers=[],
+  domain_name='',
+  private_domains=[],
+  public_domains=[])
+%}
+{% set vpc_prefix = vpc_name | title %}
+  {{ vpc_prefix + 'VpcId' }}:
+    Description: "{{ vpc_prefix + ' VPC Identifier' }}"
+    Value:
+      Ref: {{ vpc_prefix }}Vpc
+    Export:
+      Name: "{{ vpc_prefix + 'VpcId' }}"
+  {{ vpc_prefix + 'VpcCidr' }}:
+    Description: "{{ vpc_prefix + ' VPC CIDR Block' }}"
+    Value: "{{ vpc_cidr }}"
+    Export:
+      Name: "{{ vpc_prefix + 'VpcCidr' }}"
+  {{ vpc_prefix + 'VpcDnsServer' }}:
+    Description: "{{ vpc_prefix + ' VPC AWS Provided DNS Server IP Address' }}"
+    Value: "{{ vpc_cidr | ipaddr('2') | ipaddr('address') }}"
+    Export:
+      Name: "{{ vpc_prefix + 'VpcDnsServer' }}"
+  {{ vpc_prefix + 'VpcDomain' }}:
+    Description: "{{ vpc_prefix + ' VPC Domain' }}"
+    Value: "{{ vpc_domain }}"
+    Export:
+      Name: "{{ vpc_prefix + 'VpcDomain' }}"
+  {{ vpc_prefix + 'VpcZone' }}:
+    Description: "{{ vpc_prefix + ' VPC Zone' }}"
+    Value: "{{ vpc_domain }}."
+    Export:
+      Name: "{{ vpc_prefix + 'VpcZone' }}"
+{% for dns_server in dns_servers %}
+  {{ vpc_prefix + 'DnsServer' + '123'[loop.index0] }}:
+    Description: "{{ vpc_prefix + ' DNS Server ' + '123'[loop.index0] }}"
+    Value: "{{ dns_server }}"
+    Export:
+      Name: "{{ vpc_prefix + 'DnsServer' + '123'[loop.index0] }}"
+{% endfor %}
+{% for ntp_server in ntp_servers %}
+  {{ vpc_prefix + 'NtpServer' + '123'[loop.index0] }}:
+    Description: "{{ vpc_prefix + ' NTP Server ' + '123'[loop.index0] }}"
+    Value: "{{ ntp_server }}"
+    Export:
+      Name: "{{ vpc_prefix + 'NtpServer' + '123'[loop.index0] }}"
+{% endfor %}
+{% for subnet in (public_subnets + private_subnets) %}
+{% set outer_loop = loop %}
+{% for zone in range(0, az_count) %}
+{% set subnet_name = subnet | title + "Subnet" + "ABC"[loop.index0] %}
+  {{ vpc_prefix + subnet_name }}:
+    Description: "{{ vpc_prefix + " " + subnet | title + " Subnet " + "Availability Zone " + "ABC"[loop.index0] }}"
+    Value: { "Ref": "{{ vpc_prefix + subnet_name }}" }
+    Export:
+      Name: "{{ vpc_prefix + subnet_name }}"
+  {{ vpc_prefix + subnet_name + "Cidr" }}:
+    Description: "{{ vpc_prefix + " " + subnet | title + " Subnet " + "Availability Zone " + "ABC"[loop.index0] + " CIDR" }}"
+    Value: "{{ vpc_cidr | ipsubnet(subnet_size, az_count * outer_loop.index0 + loop.index0) }}"
+    Export:
+      Name: "{{ vpc_prefix + subnet_name + "Cidr" }}"
+{% endfor %}
+{% endfor %}
+{% endmacro %}

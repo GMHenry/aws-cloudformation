@@ -1,0 +1,459 @@
+{% set vpc_prefix = config_vpc_name  | title %}
+{% set az_count  = config_az_count | default(1)  | int %}
+{% set KeyName = config_application_keyname  %}
+{% set ProxyImage = config_proxy_image  %}
+{% set ProxyWhitelist = config_proxy_whitelist  %}
+{% set ApplicationImageId=config_application_ami %}
+{% set ApplicationInstanceType=config_application_instance_type %}
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Squid Forward Proxy
+
+Parameters:
+  VpcName:
+    Type: String
+    Description: VPC Name
+    Default: {{ vpc_prefix }}
+  ApplicationImageId:
+    Type: String
+    Description: Application Amazon Machine Image ID
+    Default: {{ ApplicationImageId }}
+  ApplicationInstanceType:
+    Type: String
+    Description: Application EC2 Instance Type
+    Default: {{ ApplicationInstanceType }}
+  ApplicationAutoscalingDesiredCount:
+    Type: Number
+    Description: Application Desired Count
+    Default: {{ az_count }}
+  ApplicationDesiredCount:
+    Type: Number
+    Description: Application Desired Count
+    AllowedValues:
+      - 1
+      - 2
+    Default: 1
+  KeyName:
+    Type: String
+    Description: EC2 Key Pair for SSH Access
+    Default: {{ KeyName }}
+  ProxyImage:
+    Type: String
+    Description: Docker Image for Proxy
+    Default: {{ ProxyImage }}
+  ProxyImageTag:
+    Type: String
+    Description: Docker Image Tag for Proxy
+    Default: latest
+  ProxyDisableWhitelist:
+    Type: String
+    Description: Disables whitelist when set to true.  Proxy will operate as an open proxy.
+    Default: "false"
+    AllowedValues:
+    - "true"
+    - "false"
+  ProxyWhitelist:
+    Type: String
+    Description: Comma separated list of domains to whitelist
+    Default: {{ ProxyWhitelist }}
+  ProxyNetworkMode:
+    Type: String
+    Description: Docker networking mode
+    Default: host
+    AllowedValues:
+      - host
+      - bridge
+  LogRetention:
+    Type: Number
+    Description: Log retention in days
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  SingleAzCondition:
+    Fn::Equals:
+      - Ref: ApplicationDesiredCount
+      - 1
+  DualAzCondition:
+    Fn::Equals:
+      - Ref: ApplicationDesiredCount
+      - 2
+  HostNetworkModeCondition:
+    Fn::Equals:
+      - Ref: ProxyNetworkMode
+      - host
+
+Resources:
+  ProxyDnsRecord:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      Name:
+        Fn::Join:
+          - ""
+          - - proxy.
+            - Fn::ImportValue:
+                Fn::Sub: ${VpcName}VpcDomain
+      TTL: "300"
+      HostedZoneName:
+        Fn::Join:
+          - ""
+          - - Fn::ImportValue:
+                Fn::Sub: ${VpcName}VpcDomain
+            - "."
+      Type: "CNAME"
+      Comment: 
+        Fn::Sub: "${AWS::StackName} Forward Proxy"
+      ResourceRecords:
+        - Fn::Sub: "${ApplicationLoadBalancer.DNSName}"
+  ApplicationLoadBalancer:
+    Type : "AWS::ElasticLoadBalancing::LoadBalancer"
+    Properties:
+      Scheme: "internal"
+      SecurityGroups:
+        - Ref: "ApplicationLoadBalancerSecurityGroup"
+      Subnets:
+        - Fn::ImportValue:
+            Fn::Sub: ${VpcName}PublicSubnetA
+        - Fn::If:
+          - DualAzCondition
+          - Fn::ImportValue:
+              Fn::Sub: ${VpcName}PublicSubnetB
+          - Ref: AWS::NoValue
+      CrossZone:
+        Fn::If:
+          - DualAzCondition
+          - "true"
+          - Ref: AWS::NoValue
+      ConnectionSettings:
+        IdleTimeout: 120
+      ConnectionDrainingPolicy:
+        Enabled: "true"
+        Timeout: 120
+      Listeners:
+        - LoadBalancerPort: "3128"
+          InstancePort: "3128"
+          Protocol: "tcp"
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-elb
+  ApplicationLoadBalancerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${VpcName}VpcId
+      GroupDescription: "Proxy Load Balancer Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 3128
+          ToPort: 3128
+          CidrIp:
+            Fn::ImportValue:
+              Fn::Sub: ${VpcName}VpcCidr
+  ApplicationLoadBalancerToAutoscalingIngressTCP3128:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "tcp"
+      FromPort: 3128
+      ToPort: 3128
+      GroupId: { "Ref": "ApplicationAutoscalingSecurityGroup" }
+      SourceSecurityGroupId: { "Ref": "ApplicationLoadBalancerSecurityGroup" }
+  ApplicationLoadBalancerToAutoscalingEgressTCP3128:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "tcp"
+      FromPort: 3128
+      ToPort: 3128
+      GroupId: { "Ref": "ApplicationLoadBalancerSecurityGroup" }
+      DestinationSecurityGroupId: { "Ref": "ApplicationAutoscalingSecurityGroup" }
+  ApplicationAutoscaling:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    DependsOn:
+      - DmesgLogGroup
+      - DockerLogGroup
+      - EcsAgentLogGroup
+      - EcsInitLogGroup
+      - MessagesLogGroup
+    Properties:
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            Fn::Sub: ${VpcName}PublicSubnetA
+        - Fn::If:
+          - DualAzCondition
+          - Fn::ImportValue:
+              Fn::Sub: ${VpcName}PublicSubnetB
+          - Ref: AWS::NoValue
+      LaunchConfigurationName: { "Ref" : "ApplicationAutoscalingLaunchConfiguration" }
+      MinSize: "0"
+      MaxSize: "1"
+      DesiredCapacity: { "Ref": "ApplicationDesiredCount" }
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-instance
+          PropagateAtLaunch: "true"
+  ApplicationAutoscalingLaunchConfiguration:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            10_first_run:
+              env:
+                STACK_NAME: { "Ref": "AWS::StackName" }
+                AUTOSCALING_GROUP: "ApplicationAutoscaling"
+                AWS_DEFAULT_REGION: { "Ref": "AWS::Region" }
+                ECS_CLUSTER: { "Ref": "ApplicationCluster" }
+                DOCKER_NETWORK_MODE: "host"
+              cwd: "/home/ec2-user/"
+          files:
+            /etc/ecs/ecs.config:
+              content: 
+                Fn::Sub: "ECS_CLUSTER=${ApplicationCluster}\n"
+    Properties:
+      ImageId: { "Ref": "ApplicationImageId" }
+      InstanceType: { "Ref": "ApplicationInstanceType" }
+      AssociatePublicIpAddress: "true"
+      IamInstanceProfile: { "Ref": "ApplicationAutoscalingInstanceProfile" }
+      KeyName: { "Ref": "KeyName" }
+      SecurityGroups:
+        - Ref: "ApplicationAutoscalingSecurityGroup"
+      UserData: 
+        Fn::Base64:
+          Fn::Join: ["\n", [
+            "#!/bin/bash -xe",
+            "set -e",
+            "yum install -y aws-cfn-bootstrap",
+            "yum install -y awslogs jq",
+            "Fn::Sub": "/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ApplicationAutoscalingLaunchConfiguration --region ${AWS::Region}",
+            "Fn::Sub": "/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ApplicationAutoscaling --region ${AWS::Region}"
+          ]]
+  ApplicationAutoscalingSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${VpcName}VpcId
+      GroupDescription: "Proxy Security Group"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp:
+            Fn::ImportValue:
+              Fn::Sub: ${VpcName}ManagementSubnetACidr
+        - Fn::If:
+          - DualAzCondition
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp:
+              Fn::ImportValue:
+                Fn::Sub: ${VpcName}ManagementSubnetACidr
+          - Ref: AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: "udp"
+          FromPort: 53
+          ToPort: 53
+          CidrIp:
+            Fn::Join:
+              - ""
+              - - Fn::ImportValue:
+                    Fn::Sub: ${VpcName}VpcDnsServer
+                - /32
+        - IpProtocol: "udp"
+          FromPort: 123
+          ToPort: 123
+          CidrIp: 0.0.0.0/0
+  ApplicationAutoscalingRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: [ "ec2.amazonaws.com" ]
+            Action: [ "sts:AssumeRole" ]
+      Path: "/"
+      ManagedPolicyArns: []
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                Resource:
+                  Fn::Sub: "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}*"
+        - PolicyName: "EC2ContainerInstancePolicy"
+          PolicyDocument:
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "ecs:RegisterContainerInstance"
+                  - "ecs:DeregisterContainerInstance"
+                Resource: 
+                  Fn::Sub: "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}"
+              - Effect: "Allow"
+                Action:
+                  - "ecs:DiscoverPollEndpoint"
+                  - "ecs:Submit*"
+                  - "ecs:Poll"
+                  - "ecs:StartTelemetrySession"
+                Resource: "*"
+              - Effect: "Allow"
+                Action: 
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:BatchGetImage"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:GetAuthorizationToken"
+                Resource: "*"
+  ApplicationAutoscalingInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles: [ { "Ref": "ApplicationAutoscalingRole" } ]
+  ApplicationCluster:
+    Type: "AWS::ECS::Cluster"
+  ApplicationTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      NetworkMode:
+        Ref: ProxyNetworkMode
+      ContainerDefinitions:
+      - Name: squid
+        Image:
+          Fn::Sub: ${ProxyImage}:${ProxyImageTag}
+        MemoryReservation: 500
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: 
+              Fn::Sub: ${AWS::StackName}/ecs/ProxyService/squid
+            awslogs-region: { "Ref": "AWS::Region" }
+            awslogs-stream-prefix: docker
+        PortMappings:
+            - ContainerPort: 3128
+              HostPort:
+                Fn::If:
+                  - HostNetworkModeCondition
+                  - 3128
+                  - 0
+              Protocol: tcp
+        Environment:
+        - Name: NO_WHITELIST
+          Value: { "Ref": "ProxyDisableWhitelist" }
+        - Name: SQUID_WHITELIST
+          Value: { "Ref": "ProxyWhitelist" }
+  ProxyService:
+    Type: "AWS::ECS::Service"
+    DependsOn: 
+      - ApplicationAutoscaling
+      - ProxyServiceLogGroup
+    Properties:
+      Cluster: { "Ref": "ApplicationCluster" }
+      TaskDefinition: { "Ref": "ApplicationTaskDefinition" }
+      DesiredCount: { "Ref": "ApplicationDesiredCount"}
+      DeploymentConfiguration:
+          MinimumHealthyPercent: 50
+          MaximumPercent: 200
+      LoadBalancers:
+        - ContainerName: "squid"
+          ContainerPort: "3128"
+          LoadBalancerName: { "Ref": "ApplicationLoadBalancer" }
+      Role: { "Ref": "EcsServiceRole" }
+  EcsServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: [ "ecs.amazonaws.com" ]
+            Action: [ "sts:AssumeRole" ]
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole"
+  DmesgLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/dmesg
+      RetentionInDays:
+        Ref: LogRetention
+  DockerLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/docker
+      RetentionInDays:
+        Ref: LogRetention
+  EcsAgentLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/ecs/ecs-agent
+      RetentionInDays:
+        Ref: LogRetention
+  EcsInitLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/ecs/ecs-init
+      RetentionInDays:
+        Ref: LogRetention
+  MessagesLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: 
+        Fn::Sub: ${AWS::StackName}/ec2/ApplicationAutoscaling/var/log/messages
+      RetentionInDays:
+        Ref: LogRetention
+  ProxyServiceLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: ${AWS::StackName}/ecs/ProxyService/squid
+      RetentionInDays:
+        Ref: LogRetention
+   
+Outputs:
+  ProxyHost:
+    Description: "Squid Proxy Host"
+    Value:
+      Fn::Join:
+        - ""
+        - - proxy.
+          - Fn::ImportValue:
+              Fn::Sub: ${VpcName}VpcDomain
+    Export:
+      Name:
+        Fn::Sub: ${VpcName}ProxyHost
+  ProxySecurityGroup:
+    Description: "Squid Proxy Security Group"
+    Value:
+      Ref: ApplicationLoadBalancerSecurityGroup
+    Export:
+      Name:
+        Fn::Sub: ${VpcName}ProxySecurityGroup

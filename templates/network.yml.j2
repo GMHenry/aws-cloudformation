@@ -1,0 +1,42 @@
+{% import 'macros/network.j2' as network with context %}
+{% set config_vpcs = Config.Vpcs %}
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Core Network Resources
+    
+Resources:
+{# Networking Resources #}
+{% for vpc_name, vpc_config in config_vpcs.items() %}
+{{ network.resources(
+    vpc_name | lower,
+    vpc_config.Cidr,
+    vpc_config.Domain,
+    public_subnets=vpc_config.PublicSubnets | default(['public']),
+    private_subnets=vpc_config.PrivateSubnets | default(['medium','high','management']),
+    az_count=vpc_config.AzCount | default(2) | int,
+    subnet_size=vpc_config.SubnetSize | default(24) | int,
+    domain_name=vpc_config.DomainName | default(''),
+    dns_servers=vpc_config.DnsServers | default([]),
+    ntp_servers=vpc_config.NtpServers | default([]),
+    private_domains=vpc_config.PrivateDomains | default([]),
+    public_domains=vpc_config.PublicDomains | default([]))
+}}
+{% endfor %}
+Outputs:
+{# Networking Outputs #}
+{% for vpc_name, vpc_config in config_vpcs.items() %}
+{{ network.outputs(
+    vpc_name | lower,
+    vpc_config.Cidr,
+    vpc_config.Domain,
+    public_subnets=vpc_config.PublicSubnets | default(['public']),
+    private_subnets=vpc_config.PrivateSubnets | default(['medium','high','management']),
+    az_count=vpc_config.AzCount | default(2) | int,
+    subnet_size=vpc_config.SubnetSize | default(24) | int,
+    domain_name=vpc_config.DomainName | default(''),
+    dns_servers=vpc_config.DnsServers | default([]),
+    ntp_servers=vpc_config.NtpServers | default([]),
+    private_domains=vpc_config.PrivateDomains | default([]),
+    public_domains=vpc_config.PublicDomains | default([]))
+}}
+{% endfor %}
