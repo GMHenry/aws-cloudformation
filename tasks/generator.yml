@@ -21,8 +21,8 @@
         Stack: "{{ cf_stack_template_vars | combine(Stack, recursive=True) }}"
     - name: merge stack globals
       set_fact:
-        Stack: "{{ Stack | combine({ 'Resources': Stack.Resources | dict_override(cf_stack_globals)}, recursive=True) }}"
-        cf_stack_template_vars: "{{ cf_stack_template_vars | combine({ 'Resources':cf_stack_template_vars.Resources | dict_override(cf_stack_globals)}, recursive=True) }}"
+        Stack: "{{ Stack | combine({ 'Resources': Stack.Resources}, recursive=True) }}"
+        cf_stack_template_vars: "{{ cf_stack_template_vars | combine({ 'Resources':cf_stack_template_vars.Resources}, recursive=True) }}"
     - name: create stack overrides
       set_fact:
         cf_stack_overrides: "{{ {
